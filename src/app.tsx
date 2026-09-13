@@ -66,6 +66,9 @@ const App = () => {
 
 		const action = ALL_ACTIONS.find(a => a.id === item.value);
 		if (action) {
+			if (!action.isEnabled(state!)) {
+				return;
+			}
 			setSelectedAction(action);
 			if (action.riskLevel === 'safe') {
 				executeSelectedAction(action);
@@ -152,7 +155,7 @@ const App = () => {
 
 	const items = ALL_ACTIONS.map(a => {
 		const enabled = a.isEnabled(state);
-		const label = enabled ? a.label : `${a.label} (Disabled: ${a.getDisabledReason ? a.getDisabledReason(state) : 'Not available'})`;
+		const label = enabled ? a.label : `${a.label} (Unavailable: ${a.getDisabledReason ? a.getDisabledReason(state) : 'Not applicable'})`;
 		return { label, value: a.id };
 	});
 	items.push({ label: 'Exit', value: 'exit' });
