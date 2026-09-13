@@ -68,13 +68,15 @@
 
 [Download Git Resolve on GitHub](https://github.com/StarBorn1v1/Git-Resolve/releases)
 
+
+
+
+
+
+
+
+
 #### Target Environments
-
-The CLI is intended for modern Node.js environments across all major operating systems:
-
-- Linux
-- macOS
-- Windows
 
 > **Runtime:** Node.js v18+  
 > **Package:** NPM / NPX  
