@@ -6,8 +6,11 @@ import { render } from "ink";
 
 // src/app.tsx
 import React, { useState, useEffect } from "react";
-import { Box, Text, useInput } from "ink";
+import { Box, Text, useInput, useStdout } from "ink";
 import SelectInput from "ink-select-input";
+import TextInput from "ink-text-input";
+import fs from "fs";
+import path from "path";
 
 // src/git.ts
 import { simpleGit } from "simple-git";
@@ -74,7 +77,19 @@ var ALL_ACTIONS = [
     description: "See the exact changes made in modified files.",
     riskLevel: "safe",
     isEnabled: (state) => state.isRepo && (!state.isClean || state.untracked > 0),
-    getDisabledReason: (state) => "Working directory is clean."
+    getDisabledReason: () => "Working directory is clean."
+  },
+  {
+    id: "commit_changes",
+    label: "Commit changes",
+    description: "Stage all current changes and save them to history.",
+    riskLevel: "warning",
+    isEnabled: (state) => state.isRepo && (state.staged > 0 || state.modified > 0 || state.untracked > 0),
+    getDisabledReason: () => "No changes to commit.",
+    requiresInput: {
+      prompt: "Enter a commit message:",
+      placeholder: "Fix the flux capacitor..."
+    }
   },
   {
     id: "view_history",
@@ -84,20 +99,12 @@ var ALL_ACTIONS = [
     isEnabled: (state) => state.isRepo
   },
   {
-    id: "commit_changes",
-    label: "Commit changes",
-    description: "Save your changes to history.",
-    riskLevel: "safe",
-    isEnabled: (state) => state.isRepo && (state.staged > 0 || state.modified > 0 || state.untracked > 0),
-    getDisabledReason: (state) => "No changes to commit."
-  },
-  {
     id: "stash_changes",
     label: "Stash changes",
-    description: "Set aside uncommitted changes temporarily.",
-    riskLevel: "safe",
+    description: "Set aside all uncommitted changes (including untracked files) temporarily.",
+    riskLevel: "warning",
     isEnabled: (state) => state.isRepo && (!state.isClean || state.untracked > 0),
-    getDisabledReason: (state) => "Working directory is clean."
+    getDisabledReason: () => "Working directory is clean."
   },
   {
     id: "undo_changes",
@@ -105,21 +112,14 @@ var ALL_ACTIONS = [
     description: "Discard uncommitted changes. This cannot be easily reversed.",
     riskLevel: "destructive",
     isEnabled: (state) => state.isRepo && !state.isClean,
-    getDisabledReason: (state) => "No changes to undo."
+    getDisabledReason: () => "No changes to undo."
   },
   {
     id: "recover_work",
     label: "Recover lost work",
-    description: "Look through Git reflog to find and recover lost commits or states.",
+    description: "Look through recent history to find and recover lost commits or states.",
     riskLevel: "safe",
     isEnabled: (state) => state.isRepo
-  },
-  {
-    id: "sync_remote",
-    label: "Sync with remote (Pull/Push)",
-    description: "Pull new changes and push your local commits.",
-    riskLevel: "warning",
-    isEnabled: (state) => state.isRepo && !!state.branch
   },
   {
     id: "change_theme",
@@ -132,81 +132,135 @@ var ALL_ACTIONS = [
 
 // src/executor.ts
 import { simpleGit as simpleGit2 } from "simple-git";
-async function executeAction(actionId, cwd) {
+function sanitizeErrorMessage(msg) {
+  return msg.replace(/https?:\/\/[^@\s]+@/g, "https://***@");
+}
+async function executeAction(actionId, cwd, payload) {
   const git = simpleGit2({ baseDir: cwd });
   try {
     switch (actionId) {
       case "view_status": {
         const status = await git.status();
-        let msg = `Branch: ${status.current}
+        let msg = `Branch: ${status.current || "Detached HEAD / No Branch"}
 `;
         if (status.isClean()) {
           msg += "Working directory is clean.";
         } else {
-          msg += `Modified files: ${status.modified.join(", ")}
+          if (status.staged.length > 0) {
+            msg += `Staged files: ${status.staged.join(", ")}
 `;
-          msg += `Untracked files: ${status.not_added.join(", ")}`;
+          }
+          if (status.modified.length > 0) {
+            msg += `Modified files: ${status.modified.join(", ")}
+`;
+          }
+          if (status.not_added.length > 0) {
+            msg += `Untracked files: ${status.not_added.join(", ")}`;
+          }
         }
         return { success: true, message: msg };
       }
       case "view_changes": {
+        let msg = "";
+        const stagedDiff = await git.diff(["--cached"]);
+        if (stagedDiff) {
+          msg += "=== Staged Changes ===\n";
+          msg += stagedDiff.substring(0, 2e3) + (stagedDiff.length > 2e3 ? "\n... (truncated)" : "");
+          msg += "\n\n";
+        }
         const diff = await git.diff();
-        return { success: true, message: diff.substring(0, 1e3) + (diff.length > 1e3 ? "\n... (truncated)" : "") || "No unstaged changes." };
+        if (diff) {
+          msg += "=== Unstaged Changes ===\n";
+          msg += diff.substring(0, 2e3) + (diff.length > 2e3 ? "\n... (truncated)" : "");
+        }
+        const status = await git.status();
+        if (status.not_added.length > 0) {
+          msg += "\n\n=== Untracked Files ===\n";
+          msg += status.not_added.join("\n");
+        }
+        return { success: true, message: msg || "No changes found." };
       }
       case "view_history": {
-        const log = await git.log({ maxCount: 5 });
-        const msg = log.all.map((l) => `* ${l.hash.substring(0, 7)} - ${l.message} (${l.author_name})`).join("\n");
-        return { success: true, message: msg || "No commits yet." };
+        try {
+          const log = await git.log({ maxCount: 10 });
+          const msg = log.all.map((l) => `* ${l.hash.substring(0, 7)} - ${l.message} (${l.author_name})`).join("\n");
+          return { success: true, message: msg || "No commits yet." };
+        } catch {
+          return { success: true, message: "No commits yet. This is a brand new repository." };
+        }
       }
       case "commit_changes": {
+        if (!payload || !payload.trim()) {
+          return { success: false, message: "Commit aborted: No commit message provided." };
+        }
         await git.add(".");
-        await git.commit("Quick commit from Git Resolve");
-        return { success: true, message: "Changes staged and committed successfully." };
+        await git.commit(payload.trim());
+        return { success: true, message: `Changes staged and committed successfully: "${payload.trim()}"` };
       }
       case "stash_changes": {
-        await git.stash();
-        return { success: true, message: "Changes safely stashed." };
+        await git.stash(["push", "--include-untracked"]);
+        return { success: true, message: "Changes safely stashed (including untracked files)." };
       }
       case "undo_changes": {
+        try {
+          await git.stash(["push", "--include-untracked", "-m", "AUTO-SAVE: Before Undo"]);
+        } catch {
+        }
         await git.reset(["--hard"]);
         await git.clean("f", ["-d"]);
-        return { success: true, message: "All uncommitted changes have been safely discarded." };
+        return { success: true, message: "Changes discarded. A safety stash was automatically created just in case." };
       }
       case "recover_work": {
-        const rawLog = await git.raw(["reflog", "-n", "5"]);
-        if (!rawLog.trim()) {
+        try {
+          const rawLog = await git.raw(["reflog", "--format=%H %gd %gs %cr", "-n", "10"]);
+          if (!rawLog.trim()) {
+            return { success: true, message: "No recoverable history found." };
+          }
+          const lines = rawLog.trim().split("\n").map((line) => {
+            const parts = line.split(" ");
+            const hash = parts[0].substring(0, 7);
+            const match = line.match(/^[a-f0-9]+ [^ ]+ (.+), (\d+ \w+ ago)$/);
+            if (match) {
+              return `  ${match[2]} \u2014 ${match[1]} (${hash})`;
+            }
+            return `  ${line}`;
+          });
+          return { success: true, message: `Recoverable States:
+
+${lines.join("\n")}` };
+        } catch {
           return { success: true, message: "No recoverable history found." };
         }
-        return { success: true, message: `Recoverable States:
-
-${rawLog}` };
-      }
-      case "sync_remote": {
-        await git.pull().catch(() => {
-        });
-        await git.push();
-        return { success: true, message: "Successfully synced with remote." };
       }
       default:
         return { success: false, message: `Action ${actionId} is not implemented yet.` };
     }
   } catch (e) {
-    let msg = e.message;
+    let msg = e instanceof Error ? e.message : String(e);
+    msg = sanitizeErrorMessage(msg);
     if (msg.includes("conflict")) {
       msg = "Merge conflicts detected. Please resolve them in your editor before continuing.";
-    } else if (msg.includes("Could not read from remote repository")) {
-      msg = "Cannot connect to remote repository. Check your network or credentials.";
     }
     return { success: false, message: `Operation safely aborted: ${msg}` };
   }
 }
 
 // src/app.tsx
+var HERO_ANSI = "";
+try {
+  HERO_ANSI = fs.readFileSync(path.join(process.cwd(), "assets", "hero.ans"), "utf8");
+} catch (e) {
+}
 var THEMES = {
-  classic: { border: "blue", text: "cyan", highlight: "yellow", success: "green", textDim: "gray" },
-  midnight: { border: "magenta", text: "magentaBright", highlight: "white", success: "magenta", textDim: "gray" },
-  amber: { border: "yellow", text: "yellowBright", highlight: "yellow", success: "yellowBright", textDim: "yellow" },
-  matrix: { border: "green", text: "greenBright", highlight: "green", success: "greenBright", textDim: "green" }
+  classic: { border: "blue", text: "cyan", highlight: "yellow", success: "green", error: "red", textDim: "gray" },
+  midnight: { border: "magenta", text: "magentaBright", highlight: "white", success: "magenta", error: "red", textDim: "gray" },
+  amber: { border: "yellow", text: "yellowBright", highlight: "yellow", success: "yellowBright", error: "red", textDim: "yellow" },
+  matrix: { border: "green", text: "greenBright", highlight: "green", success: "greenBright", error: "red", textDim: "green" },
+  monochrome: { border: "white", text: "whiteBright", highlight: "white", success: "whiteBright", error: "gray", textDim: "gray" },
+  synthwave: { border: "magenta", text: "cyanBright", highlight: "magentaBright", success: "cyan", error: "redBright", textDim: "magenta" },
+  ocean: { border: "blue", text: "blueBright", highlight: "cyanBright", success: "cyan", error: "red", textDim: "blue" },
+  dracula: { border: "magenta", text: "white", highlight: "magentaBright", success: "greenBright", error: "redBright", textDim: "gray" },
+  sunset: { border: "red", text: "yellowBright", highlight: "redBright", success: "yellow", error: "red", textDim: "red" }
 };
 var ASCII_HEADER = `
   ____ _ _     ____                _           
@@ -216,13 +270,20 @@ var ASCII_HEADER = `
  \\____|_|\\__| |_| \\_\\___||___/\\___/|_|\\_/ \\___|
 `;
 var App = () => {
+  const { stdout } = useStdout();
+  const [dimensions, setDimensions] = useState({
+    columns: stdout.columns || 80,
+    rows: stdout.rows || 24
+  });
   const [state, setState] = useState(null);
   const [loading, setLoading] = useState(true);
   const [screen, setScreen] = useState("main");
   const [selectedAction, setSelectedAction] = useState(null);
   const [resultMsg, setResultMsg] = useState("");
+  const [resultSuccess, setResultSuccess] = useState(true);
   const [activityRail, setActivityRail] = useState([]);
   const [themeName, setThemeName] = useState("classic");
+  const [inputText, setInputText] = useState("");
   const theme = THEMES[themeName];
   const refreshState = async () => {
     setLoading(true);
@@ -233,13 +294,43 @@ var App = () => {
   useEffect(() => {
     refreshState();
   }, []);
+  useEffect(() => {
+    let timeout;
+    const onResize = () => {
+      clearTimeout(timeout);
+      timeout = setTimeout(() => {
+        setDimensions({
+          columns: stdout.columns || 80,
+          rows: stdout.rows || 24
+        });
+      }, 50);
+    };
+    stdout.on("resize", onResize);
+    return () => {
+      clearTimeout(timeout);
+      stdout.off("resize", onResize);
+    };
+  }, [stdout]);
   useInput((input, key) => {
     if (screen === "result" && (key.return || input === " ")) {
       setScreen("main");
     } else if (screen === "briefing") {
       if (input.toLowerCase() === "y") {
-        executeSelected();
+        if (selectedAction?.requiresInput) {
+          setScreen("input");
+          setInputText("");
+        } else {
+          executeSelected();
+        }
       } else if (input.toLowerCase() === "n" || key.escape) {
+        setScreen("main");
+      }
+    } else if (screen === "themes") {
+      if (key.escape) {
+        setScreen("main");
+      }
+    } else if (screen === "input") {
+      if (key.escape) {
         setScreen("main");
       }
     }
@@ -259,7 +350,12 @@ var App = () => {
       }
       setSelectedAction(action);
       if (action.riskLevel === "safe") {
-        executeSelectedAction(action);
+        if (action.requiresInput) {
+          setScreen("input");
+          setInputText("");
+        } else {
+          executeSelectedAction(action);
+        }
       } else {
         setScreen("briefing");
       }
@@ -269,13 +365,26 @@ var App = () => {
     setThemeName(item.value);
     setScreen("main");
   };
-  const executeSelectedAction = async (action) => {
+  const executeSelectedAction = async (action, payload) => {
     setScreen("executing");
-    const res = await executeAction(action.id, process.cwd());
-    setResultMsg(res.message);
-    setActivityRail((prev) => [...prev, `\u2713 ${action.label}`]);
-    await refreshState();
-    setScreen("result");
+    try {
+      const res = await executeAction(action.id, process.cwd(), payload);
+      setResultMsg(res.message);
+      setResultSuccess(res.success);
+      if (res.success) {
+        setActivityRail((prev) => [...prev, `\u2713 ${action.label}`]);
+      } else {
+        setActivityRail((prev) => [...prev, `\u2717 ${action.label}`]);
+      }
+      await refreshState();
+      setScreen("result");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setResultMsg(`Unexpected error: ${msg}`);
+      setResultSuccess(false);
+      setActivityRail((prev) => [...prev, `\u2717 ${action.label}`]);
+      setScreen("result");
+    }
   };
   const executeSelected = () => {
     if (selectedAction) {
@@ -290,16 +399,33 @@ var App = () => {
   }
   if (screen === "themes") {
     const themeItems = Object.keys(THEMES).map((t) => ({ label: t.charAt(0).toUpperCase() + t.slice(1), value: t }));
-    return /* @__PURE__ */ React.createElement(Box, { flexDirection: "column", padding: 1 }, /* @__PURE__ */ React.createElement(Text, { bold: true, color: theme.text }, "SELECT THEME"), /* @__PURE__ */ React.createElement(Box, { marginTop: 1 }, /* @__PURE__ */ React.createElement(SelectInput, { items: themeItems, onSelect: handleThemeSelect })));
+    return /* @__PURE__ */ React.createElement(Box, { flexDirection: "column", padding: 1, borderStyle: "single", borderColor: theme.border, alignSelf: "flex-start" }, /* @__PURE__ */ React.createElement(Text, { bold: true, color: theme.text }, "SELECT THEME"), /* @__PURE__ */ React.createElement(Text, { color: theme.textDim }, "Press Esc to cancel"), /* @__PURE__ */ React.createElement(Box, { marginTop: 1 }, /* @__PURE__ */ React.createElement(SelectInput, { items: themeItems, onSelect: handleThemeSelect })));
   }
   if (screen === "briefing" && selectedAction) {
-    return /* @__PURE__ */ React.createElement(Box, { flexDirection: "column", padding: 1, borderStyle: "single", borderColor: theme.highlight }, /* @__PURE__ */ React.createElement(Text, { bold: true, color: theme.highlight }, "BRIEFING: ", selectedAction.label.toUpperCase()), /* @__PURE__ */ React.createElement(Box, { marginTop: 1, marginBottom: 1 }, /* @__PURE__ */ React.createElement(Text, { color: theme.text }, selectedAction.description)), /* @__PURE__ */ React.createElement(Text, { color: theme.text }, "Continue? (y/N)"));
+    let briefingDetails = "";
+    if (["commit_changes", "undo_changes", "stash_changes"].includes(selectedAction.id) && state) {
+      briefingDetails = `Files affected: ${state.staged} staged, ${state.modified} modified, ${state.untracked} untracked`;
+    }
+    return /* @__PURE__ */ React.createElement(Box, { flexDirection: "column", padding: 1, borderStyle: "single", borderColor: theme.highlight, alignSelf: "flex-start" }, /* @__PURE__ */ React.createElement(Text, { bold: true, color: theme.highlight }, "BRIEFING: ", selectedAction.label.toUpperCase()), /* @__PURE__ */ React.createElement(Box, { marginTop: 1, marginBottom: 1, flexDirection: "column" }, /* @__PURE__ */ React.createElement(Text, { color: theme.text }, selectedAction.description), briefingDetails && /* @__PURE__ */ React.createElement(Text, { color: theme.textDim }, briefingDetails)), /* @__PURE__ */ React.createElement(Text, { color: theme.text }, "Continue? (y/N)"));
+  }
+  if (screen === "input" && selectedAction?.requiresInput) {
+    return /* @__PURE__ */ React.createElement(Box, { flexDirection: "column", padding: 1, borderStyle: "single", borderColor: theme.highlight, alignSelf: "flex-start" }, /* @__PURE__ */ React.createElement(Text, { bold: true, color: theme.highlight }, selectedAction.requiresInput.prompt.toUpperCase()), /* @__PURE__ */ React.createElement(Box, { marginTop: 1, marginBottom: 1 }, /* @__PURE__ */ React.createElement(
+      TextInput,
+      {
+        value: inputText,
+        onChange: setInputText,
+        onSubmit: (val) => executeSelectedAction(selectedAction, val),
+        placeholder: selectedAction.requiresInput.placeholder
+      }
+    )), /* @__PURE__ */ React.createElement(Text, { color: theme.textDim }, "Press Enter to submit, Esc to cancel"));
   }
   if (screen === "executing") {
     return /* @__PURE__ */ React.createElement(Box, { padding: 1 }, /* @__PURE__ */ React.createElement(Text, { color: theme.text }, "Executing..."));
   }
   if (screen === "result") {
-    return /* @__PURE__ */ React.createElement(Box, { flexDirection: "column", padding: 1, borderStyle: "round", borderColor: theme.success }, /* @__PURE__ */ React.createElement(Text, { bold: true, color: theme.success }, "RESULT"), /* @__PURE__ */ React.createElement(Box, { marginTop: 1, marginBottom: 1 }, /* @__PURE__ */ React.createElement(Text, { color: theme.text }, resultMsg)), /* @__PURE__ */ React.createElement(Text, { color: theme.textDim }, "Press Enter to return to menu"));
+    const borderColor = resultSuccess ? theme.success : theme.error;
+    const headerText = resultSuccess ? "RESULT" : "ACTION COULD NOT BE COMPLETED";
+    return /* @__PURE__ */ React.createElement(Box, { flexDirection: "column", padding: 1, borderStyle: "round", borderColor, alignSelf: "flex-start" }, /* @__PURE__ */ React.createElement(Text, { bold: true, color: borderColor }, headerText), /* @__PURE__ */ React.createElement(Box, { marginTop: 1, marginBottom: 1 }, /* @__PURE__ */ React.createElement(Text, { color: theme.text }, resultMsg)), /* @__PURE__ */ React.createElement(Text, { color: theme.textDim }, "Press Enter to return to menu"));
   }
   const items = ALL_ACTIONS.map((a) => {
     const enabled = a.isEnabled(state);
@@ -307,9 +433,15 @@ var App = () => {
     return { label, value: a.id };
   });
   items.push({ label: "Exit", value: "exit" });
-  return /* @__PURE__ */ React.createElement(Box, { padding: 1 }, /* @__PURE__ */ React.createElement(Box, { flexDirection: "column", flexGrow: 1, paddingRight: 2 }, /* @__PURE__ */ React.createElement(Text, { color: theme.text }, ASCII_HEADER), /* @__PURE__ */ React.createElement(Box, { borderStyle: "single", borderColor: theme.border, padding: 1, marginBottom: 1, flexDirection: "column" }, /* @__PURE__ */ React.createElement(Text, null, "Project: ", state.repoRoot), /* @__PURE__ */ React.createElement(Text, null, "Branch:  ", state.branch), /* @__PURE__ */ React.createElement(Text, null, "Status:  ", state.isClean ? "Clean" : `${state.modified} modified, ${state.staged} staged, ${state.untracked} untracked`)), /* @__PURE__ */ React.createElement(Text, { bold: true, color: theme.text }, "SELECT ACTION"), /* @__PURE__ */ React.createElement(Box, { marginTop: 1 }, /* @__PURE__ */ React.createElement(SelectInput, { items, onSelect: handleSelect }))), /* @__PURE__ */ React.createElement(Box, { flexDirection: "column", width: 30, borderStyle: "single", borderColor: theme.border, paddingLeft: 1 }, /* @__PURE__ */ React.createElement(Text, { bold: true, underline: true, color: theme.text }, "ACTIVITY"), activityRail.length === 0 && /* @__PURE__ */ React.createElement(Text, { color: theme.textDim }, "No recent activity"), activityRail.map((act, i) => /* @__PURE__ */ React.createElement(Text, { key: i, color: theme.success }, act))));
+  const showHeroAndRail = dimensions.columns >= 130 && dimensions.rows >= 35;
+  const showAsciiHeader = dimensions.columns >= 75 && dimensions.rows >= 20;
+  return /* @__PURE__ */ React.createElement(Box, { padding: 1, flexDirection: "column", alignSelf: "flex-start" }, /* @__PURE__ */ React.createElement(Box, { flexDirection: "row", alignItems: "center", marginBottom: 1 }, showHeroAndRail && HERO_ANSI ? /* @__PURE__ */ React.createElement(Box, { marginRight: 2 }, /* @__PURE__ */ React.createElement(Text, { wrap: "none" }, HERO_ANSI)) : null, showAsciiHeader ? /* @__PURE__ */ React.createElement(Box, null, /* @__PURE__ */ React.createElement(Text, { bold: true, color: theme.highlight }, ASCII_HEADER)) : /* @__PURE__ */ React.createElement(Box, { marginBottom: 1 }, /* @__PURE__ */ React.createElement(Text, { bold: true, color: theme.highlight }, "=== GIT RESOLVE ==="))), /* @__PURE__ */ React.createElement(Box, { flexDirection: "row" }, /* @__PURE__ */ React.createElement(Box, { flexDirection: "column", paddingRight: showHeroAndRail ? 2 : 0 }, /* @__PURE__ */ React.createElement(Box, { borderStyle: "single", borderColor: theme.border, padding: 1, marginBottom: 1, flexDirection: "column", alignSelf: "flex-start" }, /* @__PURE__ */ React.createElement(Text, null, "Project: ", state.repoRoot), /* @__PURE__ */ React.createElement(Text, null, "Branch:  ", state.branch), /* @__PURE__ */ React.createElement(Text, null, "Status:  ", state.isClean ? "Clean" : `${state.modified} modified, ${state.staged} staged, ${state.untracked} untracked`)), /* @__PURE__ */ React.createElement(Text, { bold: true, color: theme.text }, "SELECT ACTION"), /* @__PURE__ */ React.createElement(Box, { marginTop: 1 }, /* @__PURE__ */ React.createElement(SelectInput, { items, onSelect: handleSelect }))), showHeroAndRail && /* @__PURE__ */ React.createElement(Box, { flexDirection: "column", minWidth: 30, borderStyle: "single", borderColor: theme.border, paddingLeft: 1, alignSelf: "flex-start" }, /* @__PURE__ */ React.createElement(Text, { bold: true, underline: true, color: theme.text }, "ACTIVITY"), activityRail.length === 0 && /* @__PURE__ */ React.createElement(Text, { color: theme.textDim }, "No recent activity"), activityRail.map((act, i) => /* @__PURE__ */ React.createElement(Text, { key: i, color: act.startsWith("\u2713") ? theme.success : theme.error }, act)))));
 };
 var app_default = App;
 
 // src/index.tsx
-render(/* @__PURE__ */ React2.createElement(app_default, null));
+process.stdout.write("\x1B[?1049h");
+var { unmount } = render(/* @__PURE__ */ React2.createElement(app_default, null));
+process.on("exit", () => {
+  process.stdout.write("\x1B[?1049l");
+});

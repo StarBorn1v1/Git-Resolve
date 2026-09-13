@@ -1,29 +1,37 @@
 {
   "name": "git-resolve",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "An intent-driven, local-only Git TUI that protects users from unsafe operations.",
+  "main": "./dist/index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "build": "esbuild src/index.tsx --bundle --platform=node --format=esm --packages=external --outfile=dist/index.js",
     "start": "node ./dist/index.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "author": "StarBorn1v1",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/StarBorn1v1/Git-Resolve.git"
+  },
+  "bugs": {
+    "url": "https://github.com/StarBorn1v1/Git-Resolve/issues"
+  },
+  "homepage": "https://github.com/StarBorn1v1/Git-Resolve#readme",
   "type": "module",
   "dependencies": {
-    "chalk": "^6.0.0",
     "ink": "^7.1.1",
+    "ink-image": "^2.0.0",
     "ink-select-input": "^6.2.0",
+    "ink-text-input": "^6.0.0",
     "react": "^19.3.0",
-    "simple-git": "^3.36.0"
+    "simple-git": "^3.36.0",
+    "terminal-image": "^5.0.1"
   },
   "devDependencies": {
     "@types/node": "^26.5.1",
     "@types/react": "^19.3.0",
     "esbuild": "^0.28.2",
-    "ts-node": "^10.9.2",
     "typescript": "^7.0.2"
   },
   "bin": {
